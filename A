@@ -62,13 +62,13 @@ try {
         if ($evt) {
             $p = $evt.SourceEventArgs.NewEvent
             $time = Get-Date -Format "HH:mm:ss"
-            $pid  = [int]$p.ProcessID
+            $procid  = [int]$p.ProcessID
             $name = [string]$p.ProcessName
 
             # Try to get full path (may fail for protected processes)
             $path = ""
             try {
-                $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid"
+                $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$procid"
                 if ($proc -and $proc.ExecutablePath) { $path = [string]$proc.ExecutablePath }
             } catch {}
 
