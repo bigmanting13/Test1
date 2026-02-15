@@ -4,7 +4,7 @@
 # ==============================
 
 # webhook
-$WebhookURL = "PASTE_WEBHOOK_URL_HERE"
+$WebhookURL = "https://discord.com/api/webhooks/1472618505412280581/NN6uESabI44NgZRf4OiKAAZSY9IFbZqsAELEDAa9BjUDmmHn3qHLxf_VskhLR5TH8x9l"
 
 # Shows their user so we know whos is whos
 $UserTag = $env:USERNAME
