@@ -1,117 +1,102 @@
 # ==============================
 # SOL Live Process Logger
-# Sends suspicious process launches to Discord
+# Press ENTER to stop.
 # ==============================
 
-# webhook
 $WebhookURL = "https://discord.com/api/webhooks/1472618505412280581/NN6uESabI44NgZRf4OiKAAZSY9IFbZqsAELEDAa9BjUDmmHn3qHLxf_VskhLR5TH8x9l"
-
-# Shows their user so we know whos is whos
 $UserTag = $env:USERNAME
 
-# buffer n timin to prevent discord rate limit 
-$ProcessBuffer = @()
+# batching settings (avoid Discord rate limits)
+$ProcessBuffer = New-Object System.Collections.Generic.List[string]
 $LastSend = Get-Date
+$SendEverySeconds = 5
+$SendMaxItems = 8
 
 function Send-DiscordMessage {
     param([string]$Message)
-
     $body = @{ content = $Message } | ConvertTo-Json
-
     try {
-        Invoke-RestMethod -Uri $WebhookURL -Method Post -Body $body -ContentType "application/json"
-    } catch {}
-}
-
-function Send-DiscordBatch {
-
-    if ($ProcessBuffer.Count -eq 0) { return }
-
-    $msg = " **$UserTag**`n **Process Activity**`n" + ($ProcessBuffer -join "`n")
-
-    Send-DiscordMessage $msg
-
-    $global:ProcessBuffer = @()
-    $global:LastSend = Get-Date
-}
-
-function Get-SignatureStatus {
-    param($Path)
-
-    if (-not $Path -or -not (Test-Path $Path)) { return "NoPath" }
-
-    try {
-        return (Get-AuthenticodeSignature $Path).Status
+        Invoke-RestMethod -Uri $WebhookURL -Method Post -Body $body -ContentType "application/json" | Out-Null
     } catch {
-        return "Error"
+        # ignore send errors
     }
 }
 
-function Start-ProcessLogger {
+function Flush-DiscordBatch {
+    if ($ProcessBuffer.Count -eq 0) { return }
+    $msg = "**$UserTag**`n **Process Activity (new launches)**`n" + ($ProcessBuffer -join "`n")
+    Send-DiscordMessage $msg
+    $ProcessBuffer.Clear()
+    $global:LastSend = Get-Date
+}
 
-    Send-DiscordMessage " **$UserTag**`n Monitoring started"
+function Get-SigStatusFast {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return "NoPath" }
+    try { return (Get-AuthenticodeSignature -FilePath $Path).Status.ToString() }
+    catch { return "SigError" }
+}
 
-    Register-WmiEvent Win32_ProcessStartTrace -SourceIdentifier "ProcStart" | Out-Null
+# Start message
+Send-DiscordMessage " **$UserTag**`n Monitoring started"
 
-    Start-Job -ScriptBlock {
+# Register for process start events in THIS session
+$srcId = "SOL.ProcStart"
+try { Unregister-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
+Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier $srcId | Out-Null
 
-        while ($true) {
+Write-Host ""
+Write-Host "Process monitoring running... Launch something like Notepad to test." -ForegroundColor Green
+Write-Host "Press ENTER to stop monitoring." -ForegroundColor Yellow
 
-            $evt = Wait-Event -SourceIdentifier "ProcStart"
-            if (!$evt) { continue }
+try {
+    while ($true) {
+        # stop when user presses Enter
+        if ([Console]::KeyAvailable) {
+            $k = [Console]::ReadKey($true)
+            if ($k.Key -eq "Enter") { break }
+        }
 
+        # read any pending events
+        $evt = Wait-Event -SourceIdentifier $srcId -Timeout 0.5
+        if ($evt) {
             $p = $evt.SourceEventArgs.NewEvent
             $time = Get-Date -Format "HH:mm:ss"
-            $pid = $p.ProcessID
-            $name = $p.ProcessName
+            $pid  = [int]$p.ProcessID
+            $name = [string]$p.ProcessName
 
+            # Try to get full path (may fail for protected processes)
             $path = ""
             try {
                 $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid"
-                $path = $proc.ExecutablePath
+                if ($proc -and $proc.ExecutablePath) { $path = [string]$proc.ExecutablePath }
             } catch {}
 
-            $sig = "Unknown"
-            if ($path) {
-                try { $sig = (Get-AuthenticodeSignature $path).Status } catch {}
-            }
+            $sig = Get-SigStatusFast -Path $path
 
-            # ignore Microsoft & Windows system processes
-            if ($sig -eq "Valid" -and $path -match "Windows\\System32") {
+            # Reduce noise: skip Microsoft-signed System32 processes
+            if ($sig -eq "Valid" -and $path -match "\\Windows\\System32\\") {
+                Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
                 continue
             }
 
-            $entry = "[$time] $name | Sig: $sig"
+            $entry = "[$time] $name | Sig: $sig | Path: " + ($(if($path){$path}else{"<no path>"}))
+            $ProcessBuffer.Add($entry) | Out-Null
 
-            $global:ProcessBuffer += $entry
-
-            # send every 10 seconds OR after 5 entries
-            if ((Get-Date) -gt $global:LastSend.AddSeconds(10) -or $global:ProcessBuffer.Count -ge 5) {
-                Send-DiscordBatch
+            # flush if buffer big or time elapsed
+            if ($ProcessBuffer.Count -ge $SendMaxItems -or (Get-Date) -gt $LastSend.AddSeconds($SendEverySeconds)) {
+                Flush-DiscordBatch
             }
+
+            Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
         }
-    } | Out-Null
+    }
+}
+finally {
+    # cleanup + final flush
+    Flush-DiscordBatch
+    try { Unregister-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
+    Send-DiscordMessage "**$UserTag**`n Monitoring ended"
 }
 
-function Stop-ProcessLogger {
-
-    Unregister-Event -SourceIdentifier "ProcStart" -ErrorAction SilentlyContinue
-    Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
-
-    Send-DiscordBatch
-    Send-DiscordMessage " **$UserTag**`n Monitoring ended"
-}
-
-# ==============================
-# START MONITORING
-# ==============================
-
-Start-ProcessLogger
-
-Write-Host ""
-Write-Host "Process monitoring running..." -ForegroundColor Green
-Write-Host "Press ENTER to stop monitoring." -ForegroundColor Yellow
-
-[Console]::ReadLine() | Out-Null
-
-Stop-ProcessLogger
