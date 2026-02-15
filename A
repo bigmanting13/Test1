@@ -1,6 +1,7 @@
 # ==============================
 # SOL Process Start Logger (Discord)
-# Sends ONLY first-seen processes after script starts (no repeats).
+# Sends ONLY suspicious first-seen launches after script starts.
+# Suspicious = NotSigned/SigError OR path in Temp/Downloads/Desktop.
 # Press ENTER to stop.
 # ==============================
 
@@ -13,7 +14,7 @@ $LastSend = Get-Date
 $SendEverySeconds = 5
 $SendMaxItems = 10
 
-# "seen" set: key = full path if known, otherwise name
+# first-seen set
 $Seen = New-Object 'System.Collections.Generic.HashSet[string]'
 
 function Send-DiscordMessage {
@@ -24,7 +25,7 @@ function Send-DiscordMessage {
 
 function Flush-Batch {
     if ($Buffer.Count -eq 0) { return }
-    $msg = "**$UserTag**`nProcess starts (first-seen only):`n" + ($Buffer -join "`n")
+    $msg = "**$UserTag**`nSuspicious launches (first-seen):`n" + ($Buffer -join "`n")
     Send-DiscordMessage $msg
     $Buffer.Clear()
     $global:LastSend = Get-Date
@@ -36,14 +37,31 @@ function Get-SigStatusFast {
     try { return (Get-AuthenticodeSignature -FilePath $Path).Status.ToString() } catch { return "SigError" }
 }
 
-Send-DiscordMessage "**$UserTag**`nMonitoring started"
+function Is-Suspicious {
+    param(
+        [string]$SigStatus,
+        [string]$Path
+    )
+
+    # strong signal
+    if ($SigStatus -in @("NotSigned","SigError")) { return $true }
+
+    if ($Path) {
+        $p = $Path.ToLowerInvariant()
+        if ($p -match "\\temp\\" -or $p -match "\\downloads\\" -or $p -match "\\desktop\\") { return $true }
+    }
+
+    return $false
+}
+
+Send-DiscordMessage "**$UserTag**`nMonitoring started (suspicious only)"
 
 $srcId = "SOL.ProcStart"
 try { Unregister-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
 Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier $srcId | Out-Null
 
 Write-Host ""
-Write-Host "Monitoring process starts (first-seen only). Press ENTER to stop." -ForegroundColor Green
+Write-Host "Monitoring suspicious process starts... Press ENTER to stop." -ForegroundColor Green
 
 try {
     while ($true) {
@@ -64,25 +82,29 @@ try {
         $pprocId = [int]$p.ParentProcessID
         $name = [string]$p.ProcessName
 
-        # Try to resolve path (may be empty for protected/system)
+        # resolve path best-effort
         $path = ""
         try {
             $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$procId"
             if ($proc -and $proc.ExecutablePath) { $path = [string]$proc.ExecutablePath }
         } catch {}
 
-        # Key: prefer full path; otherwise fall back to name
+        # first-seen key (path preferred)
         $key = if ($path) { $path.ToLowerInvariant() } else { ("name:" + $name.ToLowerInvariant()) }
-
-        # ONLY first time we see this key during this run
         if (-not $Seen.Add($key)) {
             Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
             continue
         }
 
         $sig = Get-SigStatusFast -Path $path
-        $pstr = if ($path) { $path } else { "<no path>" }
 
+        # filter: suspicious only
+        if (-not (Is-Suspicious -SigStatus $sig -Path $path)) {
+            Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $pstr = if ($path) { $path } else { "<no path>" }
         $entry = "[$time] $name (PID:$procId PPID:$pprocId) | Sig:$sig | $pstr"
         $Buffer.Add($entry) | Out-Null
 
