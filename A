@@ -1,6 +1,6 @@
 # ==============================
 # SOL Live Process Logger
-# Press ENTER to stop.
+# Press ENTER to stop it.
 # ==============================
 
 $WebhookURL = "https://discord.com/api/webhooks/1472618505412280581/NN6uESabI44NgZRf4OiKAAZSY9IFbZqsAELEDAa9BjUDmmHn3qHLxf_VskhLR5TH8x9l"
@@ -99,4 +99,3 @@ finally {
     try { Remove-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
     Send-DiscordMessage "**$UserTag**`n Monitoring ended"
 }
-
