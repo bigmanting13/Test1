@@ -1,5 +1,6 @@
 # ==============================
-# SOL Live Process Logger
+# SOL Process Start Logger (Discord)
+# Sends ONLY first-seen processes after script starts (no repeats).
 # Press ENTER to stop.
 # ==============================
 
@@ -7,19 +8,13 @@ $WebhookURL = "https://discord.com/api/webhooks/1472618505412280581/NN6uESabI44N
 $UserTag = $env:USERNAME
 
 # batching
-$ProcessBuffer = New-Object System.Collections.Generic.List[string]
+$Buffer = New-Object System.Collections.Generic.List[string]
 $LastSend = Get-Date
 $SendEverySeconds = 5
-$SendMaxItems = 8
+$SendMaxItems = 10
 
-# de-dupe (same Name+Path within this window)
-$DedupWindowSeconds = 20
-$LastSeen = @{}  # key -> DateTime
-
-# optional: ignore noisy apps unless unsigned/unknown
-$NoisyNames = @(
-  "msedge.exe","chrome.exe","opera.exe","Discord.exe","steam.exe"
-)
+# "seen" set: key = full path if known, otherwise name
+$Seen = New-Object 'System.Collections.Generic.HashSet[string]'
 
 function Send-DiscordMessage {
     param([string]$Message)
@@ -27,11 +22,11 @@ function Send-DiscordMessage {
     try { Invoke-RestMethod -Uri $WebhookURL -Method Post -Body $body -ContentType "application/json" | Out-Null } catch {}
 }
 
-function Flush-DiscordBatch {
-    if ($ProcessBuffer.Count -eq 0) { return }
-    $msg = "👤 **$UserTag**`n⚠️ **Process starts (new instances)**`n" + ($ProcessBuffer -join "`n")
+function Flush-Batch {
+    if ($Buffer.Count -eq 0) { return }
+    $msg = "**$UserTag**`nProcess starts (first-seen only):`n" + ($Buffer -join "`n")
     Send-DiscordMessage $msg
-    $ProcessBuffer.Clear()
+    $Buffer.Clear()
     $global:LastSend = Get-Date
 }
 
@@ -41,15 +36,14 @@ function Get-SigStatusFast {
     try { return (Get-AuthenticodeSignature -FilePath $Path).Status.ToString() } catch { return "SigError" }
 }
 
-Send-DiscordMessage "👤 **$UserTag**`n🟢 Monitoring started"
+Send-DiscordMessage "**$UserTag**`nMonitoring started"
 
 $srcId = "SOL.ProcStart"
 try { Unregister-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
 Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier $srcId | Out-Null
 
 Write-Host ""
-Write-Host "Monitoring process starts... (open Notepad to test)" -ForegroundColor Green
-Write-Host "Press ENTER to stop." -ForegroundColor Yellow
+Write-Host "Monitoring process starts (first-seen only). Press ENTER to stop." -ForegroundColor Green
 
 try {
     while ($true) {
@@ -60,7 +54,7 @@ try {
 
         $evt = Wait-Event -SourceIdentifier $srcId -Timeout 0.5
         if (-not $evt) {
-            if ((Get-Date) -gt $LastSend.AddSeconds($SendEverySeconds)) { Flush-DiscordBatch }
+            if ((Get-Date) -gt $LastSend.AddSeconds($SendEverySeconds)) { Flush-Batch }
             continue
         }
 
@@ -70,51 +64,36 @@ try {
         $pprocId = [int]$p.ParentProcessID
         $name = [string]$p.ProcessName
 
-        # Best-effort path lookup (can fail for protected processes)
+        # Try to resolve path (may be empty for protected/system)
         $path = ""
         try {
             $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$procId"
             if ($proc -and $proc.ExecutablePath) { $path = [string]$proc.ExecutablePath }
         } catch {}
 
+        # Key: prefer full path; otherwise fall back to name
+        $key = if ($path) { $path.ToLowerInvariant() } else { ("name:" + $name.ToLowerInvariant()) }
+
+        # ONLY first time we see this key during this run
+        if (-not $Seen.Add($key)) {
+            Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
+            continue
+        }
+
         $sig = Get-SigStatusFast -Path $path
-
-        # noise reduction: skip Microsoft-valid System32
-        if ($sig -eq "Valid" -and $path -match "\\Windows\\System32\\") {
-            Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
-            continue
-        }
-
-        # optional: skip noisy apps unless unsigned/unknown
-        if (($NoisyNames -contains $name) -and ($sig -eq "Valid")) {
-            Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
-            continue
-        }
-
-        # de-dupe bursts
-        $key = "$name|$path|$sig"
-        $now = Get-Date
-        if ($LastSeen.ContainsKey($key)) {
-            $delta = ($now - $LastSeen[$key]).TotalSeconds
-            if ($delta -lt $DedupWindowSeconds) {
-                Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
-                continue
-            }
-        }
-        $LastSeen[$key] = $now
-
         $pstr = if ($path) { $path } else { "<no path>" }
-        $entry = "[$time] $name (PID:$procId PPID:$pprocId) | Sig:$sig | $pstr"
-        $ProcessBuffer.Add($entry) | Out-Null
 
-        if ($ProcessBuffer.Count -ge $SendMaxItems) { Flush-DiscordBatch }
+        $entry = "[$time] $name (PID:$procId PPID:$pprocId) | Sig:$sig | $pstr"
+        $Buffer.Add($entry) | Out-Null
+
+        if ($Buffer.Count -ge $SendMaxItems) { Flush-Batch }
 
         Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
     }
 }
 finally {
-    Flush-DiscordBatch
+    Flush-Batch
     try { Unregister-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
     try { Remove-Event -SourceIdentifier $srcId -ErrorAction SilentlyContinue } catch {}
-    Send-DiscordMessage "👤 **$UserTag**`n🔴 Monitoring ended"
+    Send-DiscordMessage "**$UserTag**`nMonitoring ended"
 }
