@@ -1,0 +1,117 @@
+# ==============================
+# SOL Live Process Logger
+# Sends suspicious process launches to Discord
+# ==============================
+
+# webhook
+$WebhookURL = "PASTE_WEBHOOK_URL_HERE"
+
+# Shows their user so we know whos is whos
+$UserTag = $env:USERNAME
+
+# buffer n timin to prevent discord rate limit 
+$ProcessBuffer = @()
+$LastSend = Get-Date
+
+function Send-DiscordMessage {
+    param([string]$Message)
+
+    $body = @{ content = $Message } | ConvertTo-Json
+
+    try {
+        Invoke-RestMethod -Uri $WebhookURL -Method Post -Body $body -ContentType "application/json"
+    } catch {}
+}
+
+function Send-DiscordBatch {
+
+    if ($ProcessBuffer.Count -eq 0) { return }
+
+    $msg = " **$UserTag**`n **Process Activity**`n" + ($ProcessBuffer -join "`n")
+
+    Send-DiscordMessage $msg
+
+    $global:ProcessBuffer = @()
+    $global:LastSend = Get-Date
+}
+
+function Get-SignatureStatus {
+    param($Path)
+
+    if (-not $Path -or -not (Test-Path $Path)) { return "NoPath" }
+
+    try {
+        return (Get-AuthenticodeSignature $Path).Status
+    } catch {
+        return "Error"
+    }
+}
+
+function Start-ProcessLogger {
+
+    Send-DiscordMessage " **$UserTag**`n Monitoring started"
+
+    Register-WmiEvent Win32_ProcessStartTrace -SourceIdentifier "ProcStart" | Out-Null
+
+    Start-Job -ScriptBlock {
+
+        while ($true) {
+
+            $evt = Wait-Event -SourceIdentifier "ProcStart"
+            if (!$evt) { continue }
+
+            $p = $evt.SourceEventArgs.NewEvent
+            $time = Get-Date -Format "HH:mm:ss"
+            $pid = $p.ProcessID
+            $name = $p.ProcessName
+
+            $path = ""
+            try {
+                $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pid"
+                $path = $proc.ExecutablePath
+            } catch {}
+
+            $sig = "Unknown"
+            if ($path) {
+                try { $sig = (Get-AuthenticodeSignature $path).Status } catch {}
+            }
+
+            # ignore Microsoft & Windows system processes
+            if ($sig -eq "Valid" -and $path -match "Windows\\System32") {
+                continue
+            }
+
+            $entry = "[$time] $name | Sig: $sig"
+
+            $global:ProcessBuffer += $entry
+
+            # send every 10 seconds OR after 5 entries
+            if ((Get-Date) -gt $global:LastSend.AddSeconds(10) -or $global:ProcessBuffer.Count -ge 5) {
+                Send-DiscordBatch
+            }
+        }
+    } | Out-Null
+}
+
+function Stop-ProcessLogger {
+
+    Unregister-Event -SourceIdentifier "ProcStart" -ErrorAction SilentlyContinue
+    Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+
+    Send-DiscordBatch
+    Send-DiscordMessage " **$UserTag**`n Monitoring ended"
+}
+
+# ==============================
+# START MONITORING
+# ==============================
+
+Start-ProcessLogger
+
+Write-Host ""
+Write-Host "Process monitoring running..." -ForegroundColor Green
+Write-Host "Press ENTER to stop monitoring." -ForegroundColor Yellow
+
+[Console]::ReadLine() | Out-Null
+
+Stop-ProcessLogger
