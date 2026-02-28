@@ -1,7 +1,5 @@
 # ==============================
-# SOL Process Start Logger (Discord)
-# Sends ONLY suspicious first-seen launches after script starts.
-# Suspicious = NotSigned/SigError OR path in Temp/Downloads/Desktop.
+# SOL Process  Logger
 # Press ENTER to stop.
 # ==============================
 
